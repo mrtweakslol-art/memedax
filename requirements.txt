@@ -1,0 +1,5 @@
+telethon
+supabase
+aiohttp
+flask
+python-dotenv
