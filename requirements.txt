@@ -1,5 +1,4 @@
-telethon
-supabase
-aiohttp
-flask
-python-dotenv
+telethon==1.36.0
+flask==3.0.3
+flask-cors==4.0.0
+python-dotenv==1.0.1
