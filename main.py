@@ -1,162 +1,176 @@
 import os
 import re
 import asyncio
-import aiohttp
-from flask import Flask
 import threading
+import traceback
+from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from supabase import create_client, Client
+from flask import Flask
 
-# --- 1. CONFIGURATION (USE ENVIRONMENT VARIABLES ON RENDER) ---
-API_ID = os.environ.get('API_ID', 'YOUR_API_ID')
-API_HASH = os.environ.get('API_HASH', 'YOUR_API_HASH')
-SESSION_STRING = os.environ.get('SESSION_STRING', 'YOUR_SESSION_STRING')
-SUPABASE_URL = f"https://{os.environ.get('SUPABASE_PROJECT_ID', 'srqxksonacfhfemketxi')}.supabase.co"
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', 'YOUR_SUPABASE_ANON_KEY')
-CHANNEL_USERNAME = 'SolanaSmartMoney_Signals'
+# --- 1. EVENT LOOP FIX ---
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
-# --- 2. INITIALIZE SERVICES ---
+# --- 2. CREDENTIALS ---
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+# DEBUG: Print masked credentials to verify they loaded
+print(f"🔍 DEBUG: API_ID={API_ID}, API_HASH starts with: {API_HASH[:5] if API_HASH else 'MISSING'}")
+print(f"🔍 DEBUG: SESSION_STRING starts with: {SESSION_STRING[:15] if SESSION_STRING else 'MISSING'}")
+print(f"🔍 DEBUG: SUPABASE_URL starts with: {SUPABASE_URL[:25] if SUPABASE_URL else 'MISSING'}")
+
+CHANNEL_1 = -1003671906331
+CHANNEL_2 = '@pocket_option_signal_Quotex'
+TARGET_CHATS = [CHANNEL_1, CHANNEL_2]
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
-app = Flask(__name__)
+pending_signals = {}
 
+# --- 3. KEEP-ALIVE ---
+app = Flask('')
 @app.route('/')
 def home():
-    return "✅ Bot is running and monitoring Solana signals!"
+    return "✅ Bot is running!"
 
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+def run_web_server():
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
 
-# --- 3. HELPER FUNCTIONS ---
-async def get_direct_image_url(post_url):
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# --- 4. DATABASE FUNCTIONS ---
+async def insert_signal(data):
     try:
-        web_url = post_url.replace('t.me/', 't.me/s/')
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(web_url, headers=headers) as response:
-                html = await response.text()
-                match = re.search(r'<meta property="og:image" content="(.*?)"', html)
-                if match:
-                    return match.group(1)
+        print(f"💾 Attempting to insert into Supabase: {data['asset']} {data['direction']}")
+        response = await supabase.table("signals").insert(data).execute()
+        new_id = response.data[0]['id']
+        print(f"✅ SUCCESS: Inserted ID={new_id}")
+        return new_id
     except Exception as e:
-        print(f"⚠️ Image fetch error: {e}")
-    return None
+        print(f"❌ SUPABASE INSERT FAILED: {e}")
+        return None
 
-def parse_new_signal(text):
-    if not text: return {}
-    data = {}
-    data['coin_symbol'] = re.search(r'\$(\w+)', text)
-    data['coin_symbol'] = f"${data['coin_symbol'].group(1)}" if data['coin_symbol'] else None
-    
-    ca_match = re.search(r'CA:\s*\n?`?(\w+)`?', text)
-    data['contract_address'] = ca_match.group(1) if ca_match else None
-    
-    mc_match = re.search(r'MC:\s*\$?([\d.]+[KMB]?)', text)
-    data['market_cap'] = mc_match.group(1) if mc_match else None
-    
-    liq_match = re.search(r'Liq(?:uidity)?:\s*\$?([\d.]+[KMB]?)', text)
-    data['liquidity'] = liq_match.group(1) if liq_match else None
-    
-    score_match = re.search(r'Score:\s*(\d+/\d+)', text)
-    data['score'] = score_match.group(1) if score_match else None
-    return data
+async def update_latest_result(group_name, status):
+    try:
+        response = await supabase.table("signals").select("id").eq("group_name", group_name).or_("status.eq.PENDING,status.eq.ACTIVE,status.eq.WAITING").order("timestamp", desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            signal_id = response.data[0]['id']
+            await supabase.table("signals").update({"status": status}).eq("id", signal_id).execute()
+            print(f"✅ Updated signal {signal_id} to {status}")
+    except Exception as e:
+        print(f"❌ UPDATE FAILED: {e}")
 
-def parse_gain_update(text):
-    """Extracts gain info and the original message ID from an update post"""
-    data = {}
+# --- 5. PARSER ---
+def parse_single_message_signal(text):
+    text = text.strip()
+    pattern = r'([A-Z]{3,6}/?[A-Z]{3,6})\s+(\d+)\s+(min|minute|minutes)\s+(up|down|buy|sell|call|put)'
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return None, "Regex did not match"
     
-    # 1. Find the original message ID from the link (e.g., .../44000)
-    id_match = re.search(r't\.me/[a-zA-Z0-9_]+/(\d+)', text)
-    data['original_message_id'] = int(id_match.group(1)) if id_match else None
+    pair = match.group(1).replace('/', '').upper()
+    duration = match.group(2)
+    direction_raw = match.group(4).upper()
+    direction = "UP" if direction_raw in ['UP', 'BUY', 'CALL'] else "DOWN"
     
-    # 2. Extract Gain (matches "+50%", "X2", "X5.5", etc.)
-    gain_match = re.search(r'Gain:\s*\+?(\d+%|X[\d.]+)', text, re.IGNORECASE)
-    data['gain_percentage'] = gain_match.group(1) if gain_match else None
-    
-    # 3. Extract Time
-    time_match = re.search(r'⏱\s*Time:\s*(.+?)(?:\n|$)', text)
-    data['gain_time'] = time_match.group(1).strip() if time_match else None
-    
-    # 4. Extract Next Target
-    target_match = re.search(r'🎯\s*Next Target:\s*(.+?)(?:\n|$)', text)
-    data['next_target'] = target_match.group(1).strip() if target_match else None
-    
-    return data
+    return {"asset": pair, "expiry": f"{duration}M", "direction": direction}, "Success"
 
-# --- 4. MAIN BOT LOGIC ---
-@client.on(events.NewMessage(chats=CHANNEL_USERNAME))
-async def handler(event):
-    message = event.message
-    text = message.text or ""
-
-    # CHECK 1: Is this a GAIN UPDATE message?
-    if "Entry Signal" in text and "t.me/" in text:
-        update_data = parse_gain_update(text)
-        original_id = update_data.get('original_message_id')
-        
-        if original_id and update_data.get('gain_percentage'):
-            print(f"📈 GAIN UPDATE DETECTED! Updating original message #{original_id}")
-            print(f"   Gain: {update_data['gain_percentage']} | Time: {update_data['gain_time']}")
-            
-            try:
-                # Update the EXISTING row in Supabase
-                response = supabase.table('signals').update({
-                    'is_updated': True,
-                    'gain_percentage': update_data['gain_percentage'],
-                    'gain_time': update_data['gain_time'],
-                    'next_target': update_data['next_target']
-                }).eq('message_id', original_id).execute()
-                print(f"✅ Successfully updated original signal #{original_id} in Supabase!")
-            except Exception as e:
-                print(f"❌ Supabase Update Error: {e}")
-        return # Stop here, it's an update, not a new signal
-
-    # CHECK 2: Is this a NEW SIGNAL? (Must have a photo)
-    if not message.photo:
+# --- 6. MESSAGE HANDLER ---
+@client.on(events.NewMessage(chats=TARGET_CHATS))
+async def message_handler(event):
+    text = event.raw_text.strip()
+    chat_id = event.chat_id
+    chat_title = event.chat.title if hasattr(event.chat, 'title') and event.chat.title else str(chat_id)
+    
+    print(f"\n📨 RAW MESSAGE from [{chat_id}] {chat_title}: '{text[:80]}'")
+    
+    if not text or len(text) < 2:
+        return
+    
+    text_upper = text.upper()
+    if any(w in text_upper for w in ['WIN', 'PROFIT', '+93%', '+100%']) or '💰' in text or '✅' in text:
+        print("🔔 Detected WIN")
+        await update_latest_result(chat_title, "WIN")
+        return
+    if 'LOSS' in text_upper or '❌' in text or '💔' in text:
+        print("🔻 Detected LOSS")
+        await update_latest_result(chat_title, "LOSS")
+        return
+    
+    if chat_id == CHANNEL_1:
+        signal, reason = parse_single_message_signal(text)
+        if signal:
+            payload = {
+                "group_name": chat_title, "type": "SIGNAL", "asset": signal["asset"],
+                "direction": signal["direction"], "expiry": signal["expiry"],
+                "investment": "UNKNOWN", "status": "ACTIVE",
+                "timestamp": datetime.now().isoformat(), "raw_message": text
+            }
+            print(f"🎯 PARSED: {signal['asset']} {signal['direction']} {signal['expiry']}")
+            await insert_signal(payload)
+        else:
+            print(f"❌ PARSE FAILED: {reason}")
         return
 
-    post_url = f"https://t.me/{CHANNEL_USERNAME}/{message.id}"
-    print(f"\n📨 NEW SIGNAL DETECTED! Post: {message.id}")
-    
-    # Get Image & Parse Text
-    image_url = await get_direct_image_url(post_url)
-    parsed_data = parse_new_signal(text)
-    
-    print(f"🖼️ Image: {image_url}")
-    print(f"💰 Coin: {parsed_data.get('coin_symbol')}")
-
-    # Insert NEW row into Supabase
-    try:
-        data_to_insert = {
-            'message_id': message.id,
-            'post_url': post_url,
-            'image_url': image_url,
-            'coin_symbol': parsed_data.get('coin_symbol'),
-            'contract_address': parsed_data.get('contract_address'),
-            'market_cap': parsed_data.get('market_cap'),
-            'liquidity': parsed_data.get('liquidity'),
-            'score': parsed_data.get('score'),
-            'raw_text': text,
-            'timestamp': message.date.isoformat() if message.date else None,
-            'is_updated': False # Starts as false
-        }
+    if chat_id == CHANNEL_2 or 'pocket_option_signal' in str(chat_title).lower().replace(' ', ''):
+        if chat_id not in pending_signals:
+            pending_signals[chat_id] = {"asset": None, "expiry": None, "direction": None}
         
-        response = supabase.table('signals').insert(data_to_insert).execute()
-        print(f"✅ Saved new signal to Supabase successfully!")
+        asset_match = re.search(r'([A-Z]{3,6}/?[A-Z]{3,6})\s*(OTC)?', text_upper)
+        if asset_match and not pending_signals[chat_id]["asset"]:
+            pending_signals[chat_id]["asset"] = asset_match.group(1).replace('/', '')
+            print(f"📝 Step 1/3: Asset = {pending_signals[chat_id]['asset']}")
+            return
         
-    except Exception as e:
-        print(f"❌ Supabase Insert Error: {e}")
+        expiry_match = re.search(r'(\d+)\s*(MIN|MINUTE|MINUTES)', text_upper)
+        if expiry_match and pending_signals[chat_id]["asset"] and not pending_signals[chat_id]["expiry"]:
+            pending_signals[chat_id]["expiry"] = f"{expiry_match.group(1)}M"
+            print(f"📝 Step 2/3: Expiry = {pending_signals[chat_id]['expiry']}")
+            return
+        
+        if any(d in text_upper for d in ['UP', 'BUY', 'CALL']) and pending_signals[chat_id]["asset"] and pending_signals[chat_id]["expiry"]:
+            pending_signals[chat_id]["direction"] = "UP"
+        elif any(d in text_upper for d in ['DOWN', 'SELL', 'PUT']) and pending_signals[chat_id]["asset"] and pending_signals[chat_id]["expiry"]:
+            pending_signals[chat_id]["direction"] = "DOWN"
+            
+        if pending_signals[chat_id]["direction"]:
+            payload = {
+                "group_name": chat_title, "type": "SIGNAL", "asset": pending_signals[chat_id]["asset"],
+                "direction": pending_signals[chat_id]["direction"], "expiry": pending_signals[chat_id]["expiry"],
+                "investment": "UNKNOWN", "status": "ACTIVE",
+                "timestamp": datetime.now().isoformat(), "raw_message": f"{pending_signals[chat_id]['asset']} {pending_signals[chat_id]['expiry']} {pending_signals[chat_id]['direction']}"
+            }
+            print(f"🎯 MULTI-STEP PARSED: {payload['asset']} {payload['direction']} {payload['expiry']}")
+            await insert_signal(payload)
+            del pending_signals[chat_id]
+        return
 
+# --- 7. START WITH ERROR HANDLING ---
 async def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    print("🚀 Starting Telegram Client...")
-    await client.start()
-    print(f"✅ Logged in as {(await client.get_me()).first_name}")
-    print(f"👀 Monitoring {CHANNEL_USERNAME} for Alerts AND Gain Updates...")
-    await client.run_until_disconnected()
+    print("🚀 Pocket Option Signal Bot Starting...")
+    print(f"📡 Listening to {len(TARGET_CHATS)} channels...")
+    print("=" * 50)
+    
+    try:
+        print("🔄 Attempting to connect to Telegram...")
+        await client.start()
+        me = await client.get_me()
+        print(f"✅ SUCCESS! Connected as: {me.first_name} (@{me.username})")
+        print("⏳ Waiting for signals...")
+        await client.run_until_disconnected()
+    except Exception as e:
+        print(f"❌ FATAL ERROR connecting to Telegram!")
+        print(f"Error details: {e}")
+        traceback.print_exc()
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    loop.run_until_complete(main())
